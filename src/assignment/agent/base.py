@@ -12,13 +12,26 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
+
 from assignment.env import Environment
 from assignment.agent.tools import INVOKE_SKILL_TOOL
+
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionMessage,
+    ChatCompletionMessageParam,
+    ChatCompletionAssistantMessageParam,
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionSystemMessageParam,
+    ChatCompletionUserMessageParam,
+    ChatCompletionMessageFunctionToolCallParam,
+    ChatCompletionToolMessageParam
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -30,7 +43,12 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = '''
+        Perform detailed summarization of the following conversation for the compaction purposes.
+        The summary should reflect factual working memory from the conversation and preserve 
+        the objective, constraints, files, commands, edits, concrete results, 
+        failed approaches, tests, blockers, and next action.
+'''
 
 
 class StepLimitError(Exception):
@@ -57,7 +75,7 @@ def format_tool_output(output: dict[str, Any]) -> str:
     return "\n".join(elements)
 
 
-def rough_message_tokens(messages: list[dict[str, Any]]) -> int:
+def rough_message_tokens(messages: list[ChatCompletionMessageParam]) -> int:
     """Estimate prompt tokens without a provider-specific tokenizer."""
 
     serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
@@ -152,6 +170,7 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        self.transcript: list[list[ChatCompletionMessageParam]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,9 +183,10 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
+
         raise NotImplementedError
 
-    def query_language_model(self) -> dict[str, Any]:
+    def query_language_model(self) -> ChatCompletionMessage:
         """Send one tool-enabled Chat Completions request and normalize it."""
 
         messages = self.build_prompt()
@@ -177,6 +197,7 @@ class Agent:
             flush=True,
         )
         try:
+            # ChatCompletion
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -191,13 +212,15 @@ class Agent:
                 flush=True,
             )
             raise
-        self.api_responses.append(response.model_dump(mode="json"))
+
+        self.api_responses.append(response.model_dump())
         self.steps_taken += 1
         message = self.process_response(response)
+
         tool_names = [
-            call.get("function", {}).get("name", "unknown")
-            for call in message.get("tool_calls", [])
-            if isinstance(call, dict)
+            call.function.name
+            for call in message.tool_calls or []
+            if isinstance(call, ChatCompletionMessageFunctionToolCall)
         ]
         if tool_names:
             print(
@@ -210,12 +233,12 @@ class Agent:
                 "the loop should preserve the response and continue",
                 flush=True,
             )
+
         return message
 
-    def process_response(self, response: Any) -> dict[str, Any]:
+    def process_response(self, response: ChatCompletion) -> ChatCompletionMessage:
         """Return relevant parts of the language model's response."""
-
-        return response.choices[0].message.model_dump(exclude_none=True)
+        return response.choices[0].message
 
     def build_prompt(self) -> list[dict[str, Any]]:
         # TODO(1.1.a): Construct a sequence of messages that form the language
@@ -227,7 +250,34 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+
+        system_info = json.dumps(
+            {
+                "machine": self.env.machine,
+                "release": self.env.release,
+                "system": self.env.system,
+                "version": self.env.version,
+            },
+            indent=2,
+        )
+        SYSTEM_INFO_BLOCK = (
+            f"<system_information>\n{system_info}\n</system_information>"
+        )
+
+        if not self.transcript:
+            self.transcript.append(
+                [
+                    ChatCompletionSystemMessageParam(
+                        role="system",
+                        content=self.system_prompt + "\n" + SYSTEM_INFO_BLOCK,
+                    ),
+                    ChatCompletionUserMessageParam(
+                        role="user", content=self.task_prompt
+                    ),
+                ]
+            )
+
+        return [message for entry in self.transcript for message in entry]
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -265,9 +315,29 @@ class Agent:
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
 
-        raise NotImplementedError
+        
+        def format_transcript_entry(entry: list[ChatCompletionMessageParam], index: int):
+            assert(len(entry) > 1)
+            assistant_message = ChatCompletionAssistantMessageParam(entry[0])
+            tool_calls = cast(list[ChatCompletionMessageFunctionToolCallParam], 
+                              [call for call in assistant_message.get("tool_calls", [])  if isinstance(call, ChatCompletionMessageFunctionToolCallParam)]
+            )
+            
+            res = f"Assistant turn {index}:\n{assistant_message.content}"
+            for call in tool_calls:
+                res += f"Model calls {call.function.name}, call id {call.id} with arguments {call.function.arguments}\n"
 
-        compaction_prompt = []
+            res += f"Tool results:\n"
+            tool_results = cast(list[ChatCompletionToolMessageParam], entry[1:])
+            for result in tool_results:
+                res += f"Call id {result.tool_call_id} returned {result.content}"
+
+
+
+        compaction_prompt = [
+            ChatCompletionSystemMessageParam(role="system", content=COMPACTION_SYSTEM_PROMPT),
+            ChatCompletionUserMessageParam(role="user", content="\n".join(format_transcript_entry(self.transcript[1:-1])))
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -330,13 +400,43 @@ class Agent:
             # step. Ensure you identify when the agent has completed the task
             # by setting `Agent.finished`. If the agent exceeds the
             # `step_limit`, raise `StepLimitError`.
+            while self.steps_taken < self.step_limit and self.finished == False:
+                message = self.query_language_model()
+
+                tool_calls = []
+                if message.tool_calls:
+                    tool_calls = [
+                        call.model_dump(exclude_none=True)
+                        for call in message.tool_calls
+                        if isinstance(call, ChatCompletionMessageFunctionToolCall)
+                    ]
+
+                entries = []
+                
+                entries.append(
+                    ChatCompletionAssistantMessageParam(
+                        content=message.content,
+                        role=message.role,
+                        refusal=message.refusal,
+                    )
+                )
+
+                if tool_calls:
+                    entries[-1]["tool_calls"] = tool_calls
+                    results = self.execute_tool_calls(
+                        tool_calls[:]
+                    )
+                    entries.extend(results)
+                self.transcript.append(entries)
+
+            if self.finished == False:
+                raise StepLimitError()
 
             # TODO(2.2) Call `maybe_compact_context()` before each new action
             # request in your shared loop. It already estimates active tokens
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.

@@ -15,7 +15,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "black>=26.5.1",
+    "pytest>=8.0",
+]
 
 [project.scripts]
 assignment-chess-modal = "assignment.chess_sandbox:main"
